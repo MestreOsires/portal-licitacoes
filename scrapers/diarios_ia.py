@@ -1,23 +1,43 @@
 """
-diarios_ia.py - Extração e estruturação de editais de Diários Oficiais (PDF) com IA.
-Prioriza os estados do Maranhão (MA), Pará (PA) e Tocantins (TO).
-Utiliza pdfplumber para leitura de PDFs e OpenAI (gpt-4o-mini) para extração estruturada.
-Agendado para rodar diariamente às 12:00 e 18:00 (Horário de Brasília).
+scrapers/diarios_ia.py - Extração e estruturação automatizada de editais do
+Diário Oficial do Estado do Maranhão (DOEMA) com IA e Fallback Heurístico em Regex.
+
+Baixa diretamente os cadernos TE (Terceiros/Prefeituras) e EX (Executivo/Secretarias Estaduais)
+da rota oficial: https://diariooficial.ma.gov.br/download.php?arqv=1&arq={caderno}{YYYYMMDD}
+
+Aplica:
+1. Retrocesso automático de data (até 3 dias) caso a edição de hoje não esteja publicada.
+2. Leitura com pdfplumber em memória (BytesIO) com pré-filtro econômico de páginas.
+3. Extração estruturada (OpenAI / Gemini ou Extrator Regex nativo de alta precisão).
+4. Filtro estrito de Oportunidades Futuras (data_disputa >= agora).
+5. Gravação direta no Supabase (tabela 'licitacoes') via upsert.
+6. Agendamento diário às 12:00 e 18:00 (BRT) com suporte à flag --now para execução imediata.
 """
 
 import os
-import json
+import sys
+import io
+import re
 import time
+import json
+import hashlib
 import logging
-from io import BytesIO
+import argparse
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import urllib3
 import requests
 import pdfplumber
 import schedule
 from dotenv import load_dotenv
-from openai import OpenAI
 from supabase import create_client, Client
 
+# Desativa avisos de SSL causados pelos certificados do governo .ma.gov.br
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Carrega variáveis de ambiente
 load_dotenv()
+load_dotenv(".env.local")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,356 +45,530 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
-# Configurações do Supabase e OpenAI
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+# ============================================================================
+# CONFIGURAÇÕES SUPABASE E IA (GEMINI / OPENAI)
+# ============================================================================
+SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 supabase: Client = None
-if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logging.info(f"Supabase conectado com sucesso ({SUPABASE_URL})")
+    except Exception as e:
+        logging.warning(f"Aviso ao inicializar cliente Supabase: {e}")
 else:
-    logging.warning("Atenção: SUPABASE_URL ou SUPABASE_SERVICE_ROLE_KEY não configurados.")
+    logging.warning("Credenciais do Supabase não encontradas no .env")
 
-client_ai: OpenAI = None
+# Clientes de IA opcionais
+openai_client = None
 if OPENAI_API_KEY:
-    client_ai = OpenAI(api_key=OPENAI_API_KEY)
-else:
-    logging.warning("Atenção: OPENAI_API_KEY não configurada no .env.")
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        logging.info("OpenAI configurada com sucesso (gpt-4o-mini).")
+    except Exception as e:
+        logging.warning(f"Aviso ao carregar OpenAI: {e}")
+
+gemini_model = None
+if GEMINI_API_KEY:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+        logging.info("Google Gemini configurado com sucesso (gemini-1.5-flash).")
+    except Exception as e:
+        logging.warning(f"Aviso ao carregar Gemini: {e}")
+
+# Meses em português para decodificação de datas por extenso
+MESES_PT = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4,
+    "maio": 5, "junho": 6, "julho": 7, "agosto": 8, "setembro": 9,
+    "outubro": 10, "novembro": 11, "dezembro": 12
+}
+
+# Municípios de destaque no Maranhão para resolução precisa de órgãos
+MUNICIPIOS_MA = [
+    "SÃO LUÍS", "SAO LUIS", "IMPERATRIZ", "SÃO JOSÉ DE RIBAMAR", "SAO JOSE DE RIBAMAR",
+    "TIMON", "CAXIAS", "CODÓ", "CODO", "PAÇO DO LUMIAR", "PACO DO LUMIAR",
+    "AÇAILÂNDIA", "ACAILANDIA", "BACABAL", "BALSAS", "SANTA INÊS", "SANTA INES",
+    "BARRA DO CORDA", "PINHEIRO", "CHAPADINHA", "SANTA LUZIA", "BURITICUPU",
+    "GRAJAÚ", "GRAJAU", "ITAPECURU MIRIM", "COROATÁ", "COROATA", "BARREIRINHAS",
+    "TUTÓIA", "TUTOIA", "VIANA", "ZÉ DOCA", "ZE DOCA", "COLINAS", "CURURUPU",
+    "GODOFREDO VIANA", "LAGOA DO MATO", "PRESIDENTE DUTRA", "CAROLINA", "RIACHÃO",
+    "RIACHAO", "SÃO JOÃO DOS PATOS", "SAO JOAO DOS PATOS", "PEDREIRAS", "ESTREITO",
+    "ARARI", "LAGO DA PEDRA", "COELHO NETO", "SANTA HELENA", "ROSÁRIO", "ROSARIO",
+    "VITÓRIA DO MEARIM", "VITORIA DO MEARIM", "URBANO SANTOS", "MIRADOR", "LAGO DO JUNCO"
+]
+
+TERMOS_PRE_FILTRO = [
+    "AVISO DE LICITAÇÃO", "AVISO DE LICITACAO", "PREGÃO", "PREGAO",
+    "CONCORRÊNCIA", "CONCORRENCIA", "DISPENSA DE LICITAÇÃO", "DISPENSA",
+    "TOMADA DE PREÇO", "TOMADA DE PRECO", "ABERTURA", "CHAMAMENTO PÚBLICO",
+    "CHAMAMENTO PUBLICO", "CREDENCIAMENTO"
+]
 
 # ============================================================================
-# FONTES E URLs DOS DIÁRIOS OFICIAIS (MA, PA e TO)
+# 1. DOWNLOAD DINÂMICO DO DOEMA (TE e EX) COM RETROCESSO AUTOMÁTICO
 # ============================================================================
-FONTES_DIARIOS = {
-    "MA": [
-        {
-            "nome": "Diário Oficial dos Municípios do Maranhão (FAMEM)",
-            "orgao_emissor": "Federação dos Municípios do Estado do Maranhão",
-            "url_portal": "https://diario.famem.org.br",
-            "exemplo_pdf": "https://diario.famem.org.br/edicoes/download_exemplo.pdf"
-        },
-        {
-            "nome": "Diário Oficial do Estado do Maranhão (DOEMA)",
-            "orgao_emissor": "Governo do Estado do Maranhão",
-            "url_portal": "https://www.diariooficial.ma.gov.br",
-            "exemplo_pdf": "https://www.diariooficial.ma.gov.br/diario/exemplo.pdf"
-        }
-    ],
-    "PA": [
-        {
-            "nome": "Diário Oficial dos Municípios do Pará (FAMEP)",
-            "orgao_emissor": "Federação das Associações de Municípios do Pará",
-            "url_portal": "https://diariomunicipal.com.br/famep/",
-            "exemplo_pdf": "https://diariomunicipal.com.br/famep/download.pdf"
-        },
-        {
-            "nome": "Imprensa Oficial do Estado do Pará (IOEPA)",
-            "orgao_emissor": "Governo do Estado do Pará",
-            "url_portal": "https://www.ioepa.com.br",
-            "exemplo_pdf": "https://www.ioepa.com.br/diarios/exemplo.pdf"
-        }
-    ],
-    "TO": [
-        {
-            "nome": "Diário Oficial dos Municípios do Tocantins (ATM)",
-            "orgao_emissor": "Associação Tocantinense de Municípios",
-            "url_portal": "https://diariomunicipal.com.br/atm/",
-            "exemplo_pdf": "https://diariomunicipal.com.br/atm/download.pdf"
-        },
-        {
-            "nome": "Diário Oficial do Estado do Tocantins (DOE-TO)",
-            "orgao_emissor": "Governo do Estado do Tocantins",
-            "url_portal": "https://diariooficial.to.gov.br",
-            "exemplo_pdf": "https://diariooficial.to.gov.br/diario/exemplo.pdf"
-        }
-    ]
-}
-
-# Dicionário de cidades e coordenadas das UFs foco
-CIDADES_COORDENADAS = {
-    # Maranhão (MA)
-    "SÃO LUÍS": (-44.3028, -2.5297, "MA"),
-    "SAO LUIS": (-44.3028, -2.5297, "MA"),
-    "IMPERATRIZ": (-47.4917, -5.5264, "MA"),
-    "CAXIAS": (-43.3561, -4.8589, "MA"),
-    "TIMON": (-42.8375, -5.0939, "MA"),
-    "AÇAILÂNDIA": (-47.5039, -4.9458, "MA"),
-    
-    # Pará (PA)
-    "BELÉM": (-48.4902, -1.4558, "PA"),
-    "BELEM": (-48.4902, -1.4558, "PA"),
-    "ANANINDEUA": (-48.3717, -1.3653, "PA"),
-    "SANTARÉM": (-54.7086, -2.4431, "PA"),
-    "SANTAREM": (-54.7086, -2.4431, "PA"),
-    "MARABÁ": (-49.1178, -5.3686, "PA"),
-    "PARAUAPEBAS": (-49.9036, -6.0675, "PA"),
-    
-    # Tocantins (TO)
-    "PALMAS": (-48.3336, -10.1844, "TO"),
-    "ARAGUAÍNA": (-48.2033, -7.1917, "TO"),
-    "ARAGUAINA": (-48.2033, -7.1917, "TO"),
-    "GURUPI": (-49.0689, -11.7297, "TO"),
-    "PORTO NACIONAL": (-48.4169, -10.7081, "TO")
-}
-
-CAPITAIS_DEFAULT = {
-    "MA": (-44.3028, -2.5297),
-    "PA": (-48.4902, -1.4558),
-    "TO": (-48.3336, -10.1844)
-}
-
-def normalizar_texto(texto: str) -> str:
-    if not texto:
-        return ""
-    import unicodedata
-    return "".join(
-        c for c in unicodedata.normalize("NFD", texto)
-        if unicodedata.category(c) != "Mn"
-    ).upper().strip()
-
-def identificar_uf_municipio(municipio_raw: str, estado_raw: str, texto_contexto: str):
+def baixar_caderno_doema(caderno: str, data_alvo: datetime, retroceder_dias: int = 3) -> tuple:
     """
-    Higieniza e garante que a coluna 'estado' seja estritamente 'MA', 'PA' ou 'TO'
-    caso identificável pelo nome da cidade ou contexto do órgão licitante.
+    Tenta baixar o PDF do caderno (TE ou EX) para a data informada.
+    Caso não esteja disponível (não PDF ou vazio), retrocede automaticamente até N dias anteriores.
+    Retorna (bytes_pdf, url_usada, data_efetiva_str).
     """
-    muni_norm = normalizar_texto(municipio_raw)
-    uf_norm = (estado_raw or "").upper().strip()
-    texto_norm = normalizar_texto(texto_contexto)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/pdf, text/html, */*",
+        "Referer": "https://diariooficial.ma.gov.br/"
+    }
 
-    # 1. Verifica no dicionário de cidades conhecidas
-    if muni_norm in CIDADES_COORDENADAS:
-        lng, lat, uf_detectada = CIDADES_COORDENADAS[muni_norm]
-        return municipio_raw, uf_detectada, f"POINT({lng} {lat})"
+    for i in range(retroceder_dias + 1):
+        data_tentativa = data_alvo - timedelta(days=i)
+        data_str = data_tentativa.strftime("%Y%m%d")
+        url = f"https://diariooficial.ma.gov.br/download.php?arqv=1&arq={caderno}{data_str}"
 
-    # 2. Se a UF já foi identificada como uma das UFs alvo
-    if uf_norm in ["MA", "PA", "TO"]:
-        lng, lat = CAPITAIS_DEFAULT[uf_norm]
-        return municipio_raw, uf_norm, f"POINT({lng} {lat})"
+        try:
+            logging.info(f"[{caderno}] Tentando download da edição {data_str}: {url}")
+            resp = requests.get(url, headers=headers, verify=False, timeout=60)
 
-    # 3. Busca no contexto textual do edital
-    if "MARANHAO" in texto_norm or "FAMEM" in texto_norm or "DOEMA" in texto_norm:
-        lng, lat = CAPITAIS_DEFAULT["MA"]
-        return municipio_raw or "São Luís", "MA", f"POINT({lng} {lat})"
-    elif "PARA" in texto_norm or "FAMEP" in texto_norm or "IOEPA" in texto_norm:
-        lng, lat = CAPITAIS_DEFAULT["PA"]
-        return municipio_raw or "Belém", "PA", f"POINT({lng} {lat})"
-    elif "TOCANTINS" in texto_norm or "ATM" in texto_norm or "DOE-TO" in texto_norm:
-        lng, lat = CAPITAIS_DEFAULT["TO"]
-        return municipio_raw or "Palmas", "TO", f"POINT({lng} {lat})"
+            # Valida se o conteúdo é realmente um PDF (mágico %PDF nos primeiros 4 bytes)
+            if resp.status_code == 200 and resp.content[:4] == b"%PDF" and len(resp.content) > 5000:
+                logging.info(f"[{caderno}] Edição {data_str} obtida com sucesso! Tamanho: {len(resp.content) / 1024:.1f} KB")
+                return resp.content, url, data_str
+            else:
+                logging.warning(f"[{caderno}] Edição {data_str} ainda não disponível ou sem PDF válido (len={len(resp.content)}).")
+        except Exception as e:
+            logging.error(f"[{caderno}] Erro ao tentar baixar edição {data_str}: {e}")
 
-    # Fallback genérico caso não encontre
-    return municipio_raw or "Não informado", (uf_norm[:2] if len(uf_norm) >= 2 else "BR"), "POINT(-47.9292 -15.7801)"
+    return None, None, None
 
-def extrair_texto_pdf(pdf_source) -> str:
+# ============================================================================
+# 2. PARSER DE DATAS E HORAS (DD/MM/AAAA e Por Extenso)
+# ============================================================================
+def extrair_data_hora_abertura(texto: str) -> str:
     """
-    Extrai o texto das primeiras páginas do Diário Oficial com pdfplumber.
+    Localiza a data e hora de disputa/abertura no texto do aviso.
+    Ignora menções a leis como a 'Lei 14.133 de 1º de abril de 2021'.
+    Retorna data em formato ISO (YYYY-MM-DDTHH:MM:SS) ou None.
     """
-    texto_completo = []
-    with pdfplumber.open(pdf_source) as pdf:
-        for pagina in pdf.pages[:15]:
-            texto = pagina.extract_text()
-            if texto:
-                texto_completo.append(texto)
-    return "\n".join(texto_completo)
+    # Remove ou substitui referências à Lei 14.133 de 2021 para não confundir a data
+    texto_limpo = re.sub(r'Lei\s+(?:Federal\s+)?n[º°\.]?\s*14\.133[^\n]*?2021', '', texto, flags=re.IGNORECASE)
 
-def processar_com_ia(texto_diario: str, uf_padrao: str = "MA") -> list:
+    # 1. Busca por padrões de abertura com data numérica (ex: 04/11/2026 às 09h30min)
+    padrao_numerico = re.compile(
+        r'(?:abertura|sess[ãa]o|disputa|realizar\s+em|recebimento)[^\n]*?(?:no dia\s+)?(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})(?:[^\n]*?(\d{1,2})[h:](\d{2}))?',
+        re.IGNORECASE
+    )
+    m = padrao_numerico.search(texto_limpo)
+    if m:
+        dia, mes, ano = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        hora = int(m.group(4)) if m.group(4) else 9
+        minuto = int(m.group(5)) if m.group(5) else 0
+        try:
+            return datetime(ano, mes, dia, hora, minuto).strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            pass
+
+    # 2. Busca por datas por extenso (ex: 13 de novembro de 2026, às 09h00min)
+    padrao_extenso = re.compile(
+        r'(?:abertura|sess[ãa]o|disputa|realizar\s+em|recebimento)[^\n]*?(\d{1,2})\s+de\s+([a-zç]+)\s+de\s+(\d{4})(?:[^\n]*?(\d{1,2})[h:](\d{2}))?',
+        re.IGNORECASE
+    )
+    m_ext = padrao_extenso.search(texto_limpo)
+    if m_ext:
+        dia = int(m_ext.group(1))
+        mes_nome = m_ext.group(2).lower()
+        ano = int(m_ext.group(3))
+        mes = MESES_PT.get(mes_nome)
+        if mes:
+            hora = int(m_ext.group(4)) if m_ext.group(4) else 9
+            minuto = int(m_ext.group(5)) if m_ext.group(5) else 0
+            try:
+                return datetime(ano, mes, dia, hora, minuto).strftime("%Y-%m-%dT%H:%M:%S")
+            except Exception:
+                pass
+
+    # 3. Fallback genérico para qualquer data com ano futuro (2026+) no bloco
+    padrao_generico = re.compile(r'(\d{1,2})[\/\.](\d{1,2})[\/\.](202[6-9])(?:[^\n]*?(\d{1,2})[h:](\d{2}))?')
+    m_gen = padrao_generico.search(texto_limpo)
+    if m_gen:
+        dia, mes, ano = int(m_gen.group(1)), int(m_gen.group(2)), int(m_gen.group(3))
+        hora = int(m_gen.group(4)) if m_gen.group(4) else 9
+        minuto = int(m_gen.group(5)) if m_gen.group(5) else 0
+        try:
+            return datetime(ano, mes, dia, hora, minuto).strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            pass
+
+    return None
+
+# ============================================================================
+# 3. EXTRATOR REGEX / HEURÍSTICO NATIVO (FALLBACK ROBUSTO SEM CUSTO DE IA)
+# ============================================================================
+def extrair_licitacoes_heuristicas(texto_pagina: str, data_edicao: str, link_pdf: str, caderno: str) -> list:
     """
-    Envia o texto para a OpenAI com instrução prioritária para identificar e
-    padronizar o município e a UF (especialmente MA, PA e TO).
+    Extrator heurístico determinístico que identifica avisos de licitação em páginas do DOEMA.
     """
-    if not client_ai:
-        logging.error("Cliente OpenAI não inicializado. Configure OPENAI_API_KEY no .env.")
-        return []
+    editais = []
 
-    prompt_sistema = f"""
-Você é um auditor sênior especialista em análise de Diários Oficiais brasileiros.
-Sua prioridade máxima é extrair avisos de licitação (Pregões, Concorrências, Dispensas e Tomadas de Preço) com foco prioritário nos estados do MARANHÃO (MA), PARÁ (PA) e TOCANTINS (TO).
+    # Divide a página em blocos a partir de marcadores clássicos de aviso
+    delimitador = r'(?=(?:AVISO DE (?:LICITA[ÇC][ÃA]O|PREG[ÃA]O|CONCORR[ÊE]NCIA|DISPENSA|LEIL[ÃA]O|CHAMAMENTO)|Aviso de (?:Licita[çc][ãa]o|Dispensa|Preg[ãa]o)))'
+    blocos = re.split(delimitador, texto_pagina, flags=re.IGNORECASE)
 
-INSTRUÇÃO CRÍTICA DE LOCALIZAÇÃO:
-1. Identifique obrigatoriamente o MUNICÍPIO e a UF exata (campo 'estado').
-2. Se o órgão ou município for do Maranhão, preencha 'estado': 'MA'.
-3. Se o órgão ou município for do Pará, preencha 'estado': 'PA'.
-4. Se o órgão ou município for do Tocantins, preencha 'estado': 'TO'.
-5. JAMAIS retorne 'BR' se houver qualquer menção à cidade ou estado no texto. Em caso de dúvida sobre a publicação atual, use a UF de contexto: '{uf_padrao}'.
+    # Identifica órgão geral do cabeçalho da página (se houver)
+    orgao_cabecalho = "Governo do Estado do Maranhão"
+    m_cab = re.search(r'(PREFEITURA MUNICIPAL DE [^\n\-–]+|SECRETARIA DE ESTADO [^\n\-–]+|EMAP|UEMA|CAEMA|DETRAN[^\n]*)', texto_pagina, re.IGNORECASE)
+    if m_cab:
+        orgao_cabecalho = m_cab.group(1).strip()
 
-Retorne SEMPRE um JSON válido estritamente neste formato:
-{{
-  "licitacoes": [
-    {{
-      "id_externo": "DO_<SIGLA_UF>_<NUMERO_PROCESSO_OU_HASH>",
-      "orgao": "Nome oficial do órgão promotor",
-      "objeto": "Descrição detalhada do que está sendo contratado",
-      "valor_estimado": 0.00,
-      "data_disputa": "AAAA-MM-DDTHH:MM:SSZ",
-      "link_edital": "URL constante no texto ou null",
-      "municipio": "Nome do Município",
-      "estado": "MA, PA ou TO",
-      "longitude": -44.3028,
-      "latitude": -2.5297
-    }}
-  ]
-}}
-Caso não existam avisos de licitação, retorne: {{"licitacoes": []}}.
+    for bloco in blocos:
+        bloco_limpo = bloco.strip()
+        if len(bloco_limpo) < 80:
+            continue
+
+        # Verifica se o bloco realmente trata de licitação
+        bloco_up = bloco_limpo.upper()
+        if not any(t in bloco_up for t in ["OBJETO", "PREGÃO", "PREGAO", "CONCORRÊNCIA", "DISPENSA", "ABERTURA", "SRP"]):
+            continue
+
+        # 1. Data de Abertura / Disputa
+        data_disputa = extrair_data_hora_abertura(bloco_limpo)
+        if not data_disputa:
+            # Sem data de abertura futura confirmada -> ignora para evitar poluição
+            continue
+
+        # 2. Órgão Licitante
+        orgao = orgao_cabecalho
+        m_org = re.search(r'(PREFEITURA MUNICIPAL DE [^\n–-]+|PREFEITURA DE [^\n–-]+|MUNIC[IÍ]PIO DE [^\n–-]+|SECRETARIA DE ESTADO [^\n–-]+|DEPARTAMENTO [^\n–-]+|FUNDO MUNICIPAL DE [^\n–-]+)', bloco_limpo, re.IGNORECASE)
+        if m_org:
+            orgao = m_org.group(1).strip()
+
+        # 3. Município do Maranhão
+        municipio = "São Luís"  # Padrão capital para órgãos estaduais
+        for cid in MUNICIPIOS_MA:
+            if cid in orgao.upper() or cid in bloco_limpo[:300].upper():
+                municipio = cid.title()
+                break
+
+        # 4. Modalidade
+        modalidade = "Pregão Eletrônico"
+        if "DISPENSA" in bloco_up:
+            modalidade = "Dispensa Eletrônica"
+        elif "CONCORRÊNCIA" in bloco_up or "CONCORRENCIA" in bloco_up:
+            modalidade = "Concorrência Eletrônica"
+        elif "CHAMAMENTO" in bloco_up:
+            modalidade = "Chamamento Público"
+        elif "LEILÃO" in bloco_up or "LEILAO" in bloco_up:
+            modalidade = "Leilão"
+        elif "PRESENCIAL" in bloco_up:
+            modalidade = "Pregão Presencial"
+
+        # 5. Objeto da Licitação
+        objeto = "Objeto da licitação detalhado no edital do DOEMA."
+        m_obj = re.search(r'OBJETO\s*:\s*([^.\n]+(?:\.[^.\n]+){0,3})', bloco_limpo, re.IGNORECASE)
+        if m_obj:
+            objeto = m_obj.group(1).strip()
+            # Limpa quebras de linha excessivas
+            objeto = re.sub(r'\s+', ' ', objeto)
+        elif len(bloco_limpo) > 100:
+            linhas = [l.strip() for l in bloco_limpo.split('\n') if len(l.strip()) > 20 and not l.isupper()]
+            if linhas:
+                objeto = " ".join(linhas[:2])
+
+        # 6. Valor Estimado (se mencionado no aviso)
+        valor_estimado = None
+        m_val = re.search(r'R\$\s*([\d\.]+(?:,\d{2})?)', bloco_limpo)
+        if m_val:
+            try:
+                val_limpo = m_val.group(1).replace(".", "").replace(",", ".")
+                valor_estimado = float(val_limpo)
+            except Exception:
+                pass
+
+        # 7. Número do Processo / Edital
+        m_num = re.search(r'(?:N[º°o]\s*|Processo\s*[:.]?\s*)([A-Z0-9\/\.\-]+)', bloco_limpo, re.IGNORECASE)
+        numero_processo = m_num.group(1).strip() if m_num else f"DOEMA-{caderno}-{data_edicao}"
+
+        # 8. Hash único id_externo
+        hash_seed = f"{caderno}-{data_edicao}-{orgao}-{objeto[:50]}-{data_disputa}"
+        id_hash = hashlib.md5(hash_seed.encode("utf-8")).hexdigest()[:10]
+        id_externo = f"DOEMA-{caderno}-{data_edicao}-{id_hash}"
+
+        # 9. Esfera e Tipo de Publicação
+        esfera = "Estadual" if any(k in orgao.upper() for k in ["ESTADO", "SECRETARIA", "EMAP", "UEMA", "CAEMA", "DETRAN"]) else "Municipal"
+        tipo_pub = "COTACAO" if "DISPENSA" in modalidade.upper() else "AVISO"
+
+        editais.append({
+            "id_externo": id_externo,
+            "orgao": orgao[:255],
+            "objeto": objeto[:1000],
+            "valor_estimado": valor_estimado,
+            "data_disputa": data_disputa,
+            "link_edital": link_pdf,
+            "municipio": municipio[:100],
+            "estado": "MA",
+            "modalidade": modalidade[:100],
+            "regiao": "Nordeste",
+            "esfera": esfera,
+            "tipo_publicacao": tipo_pub,
+            "numero_processo": numero_processo[:50],
+            "fonte": "DOEMA"
+        })
+
+    return editais
+
+# ============================================================================
+# 4. EXTRATOR COM INTELIGÊNCIA ARTIFICIAL (GEMINI / OPENAI)
+# ============================================================================
+def extrair_licitacoes_com_ia(texto_bloco: str, data_edicao: str, link_pdf: str, caderno: str) -> list:
+    """
+    Envia bloco de páginas com editais para a OpenAI ou Google Gemini estruturar em JSON.
+    Se nenhuma IA estiver disponível, aciona automaticamente o extrator heurístico.
+    """
+    prompt = f"""
+Você é um especialista em compras públicas brasileiras. Analise o seguinte extrato do Diário Oficial do Estado do Maranhão (DOEMA - Caderno {caderno}, Edição {data_edicao}).
+
+Extraia EXCLUSIVAMENTE avisos de licitação (Pregão, Concorrência, Dispensa, Leilão, Chamamento) com abertura futura.
+Ignore portarias, decretos, balanços financeiros ou atas que não sejam avisos de nova licitação.
+
+Retorne SOMENTE um JSON Array contendo objetos com os seguintes campos:
+- "orgao": Nome do órgão público ou prefeitura municipal.
+- "municipio": Nome da cidade no Maranhão (se órgão estadual na capital, use "São Luís").
+- "modalidade": Ex: "Pregão Eletrônico", "Concorrência Eletrônica", "Dispensa Eletrônica".
+- "objeto": Descrição completa e clara do que está sendo licitado.
+- "valor_estimado": float numérico ou null.
+- "data_disputa": Data e hora da abertura em formato ISO 'YYYY-MM-DDTHH:MM:SS' (ex: '2026-11-04T09:30:00').
+- "numero_processo": Número do edital/processo ou null.
+
+Texto do Diário:
+\"\"\"
+{texto_bloco}
+\"\"\"
 """
 
-    try:
-        response = client_ai.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": prompt_sistema},
-                {"role": "user", "content": f"Texto do Diário Oficial para análise:\n\n{texto_diario[:14000]}"}
-            ],
-            temperature=0.1
-        )
-
-        conteudo = response.choices[0].message.content
-        resultado = json.loads(conteudo)
-        return resultado.get("licitacoes", [])
-    except Exception as e:
-        logging.error(f"Erro na extração via OpenAI: {e}")
-        return []
-
-def baixar_e_processar_diario(pdf_url_ou_path: str = None, uf_alvo: str = "MA"):
-    """
-    Processa um PDF real de Diário Oficial ou simula extrações representativas de MA, PA e TO.
-    """
-    logging.info(f"Iniciando rotina de Diários Oficiais (Foco: {uf_alvo})...")
-
-    if pdf_url_ou_path and pdf_url_ou_path.startswith("http"):
+    # 1. Tentativa com OpenAI
+    if openai_client:
         try:
-            logging.info(f"Baixando Diário Oficial ({uf_alvo}): {pdf_url_ou_path}")
-            resp = requests.get(pdf_url_ou_path, timeout=60)
-            if resp.status_code == 200:
-                arquivo_pdf = BytesIO(resp.content)
-                texto = extrair_texto_pdf(arquivo_pdf)
-                editais = processar_com_ia(texto, uf_padrao=uf_alvo)
-                salvar_editais_supabase(editais, texto_contexto=texto)
-                return
-        except Exception as err:
-            logging.warning(f"Não foi possível baixar PDF da URL ({pdf_url_ou_path}): {err}. Executando amostras representativas.")
+            logging.info("Chamando OpenAI (gpt-4o-mini) para estruturação de editais...")
+            completion = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Você é um extrator de editais de diários oficiais. Responda apenas com array JSON válido."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            raw_content = completion.choices[0].message.content
+            parsed = json.loads(raw_content)
+            itens = parsed if isinstance(parsed, list) else parsed.get("licitacoes") or parsed.get("editais") or list(parsed.values())[0]
 
-    # Modo de demonstração com amostras reais de editais do MA, PA e TO
-    logging.info(f"Processando amostras estruturadas de Diários Oficiais para os estados MA, PA e TO...")
-    
-    amostras_diarios = [
-        # Maranhão (MA)
-        {
-            "uf": "MA",
-            "texto": """
-            ESTADO DO MARANHÃO - PREFEITURA MUNICIPAL DE SÃO LUÍS
-            DIÁRIO OFICIAL DOS MUNICÍPIOS DO ESTADO DO MARANHÃO (FAMEM)
-            AVISO DE LICITAÇÃO - PREGÃO ELETRÔNICO Nº 042/2026-PMSL
-            Objeto: Registro de preços para aquisição de kits pedagógicos e mobiliário escolar para a rede de ensino fundamental de São Luís/MA.
-            Valor Estimado: R$ 3.250.000,00.
-            Abertura das propostas: 28/11/2026 às 10:00 horas.
-            Edital disponível no portal: https://saoluis.ma.gov.br/editais/pregao-042-2026
-            """
-        },
-        # Pará (PA)
-        {
-            "uf": "PA",
-            "texto": """
-            ESTADO DO PARÁ - PREFEITURA MUNICIPAL DE SANTARÉM
-            FEDERAÇÃO DAS ASSOCIAÇÕES DE MUNICÍPIOS DO PARÁ (FAMEP)
-            AVISO DE PREGÃO ELETRÔNICO Nº 088/2026-SEMED
-            Objeto: Contratação de serviços de transporte escolar fluvial e terrestre para atender alunos da zona ribeirinha de Santarém/PA.
-            Valor Total Estimado: R$ 4.780.000,00.
-            Data da Disputa: 02/12/2026 às 09:00 horas no portal compras.gov.br.
-            Link oficial: https://santarem.pa.gov.br/transporte-fluvial-2026
-            """
-        },
-        # Tocantins (TO)
-        {
-            "uf": "TO",
-            "texto": """
-            ESTADO DO TOCANTINS - PREFEITURA MUNICIPAL DE PALMAS
-            ASSOCIAÇÃO TOCANTINENSE DE MUNICÍPIOS (ATM)
-            AVISO DE LICITAÇÃO - CONCORRÊNCIA ELETRÔNICA Nº 015/2026
-            Objeto: Obras de drenagem pluvial, pavimentação em CBUQ e sinalização viária nas quadras industriais de Palmas/TO.
-            Valor Estimado: R$ 7.920.000,00.
-            Recebimento de propostas até: 10/12/2026 às 14:30 horas.
-            Edital completo: https://palmas.to.gov.br/licitacoes/concorrencia-015-2026
-            """
-        }
-    ]
+            if isinstance(itens, list) and len(itens) > 0:
+                formatados = []
+                for it in itens:
+                    hash_val = hashlib.md5(f"{it.get('orgao')}{it.get('objeto')}{it.get('data_disputa')}".encode()).hexdigest()[:8]
+                    formatados.append({
+                        "id_externo": f"DOEMA-{caderno}-{data_edicao}-{hash_val}",
+                        "orgao": str(it.get("orgao") or "Órgão Público Estadual/Municipal - MA")[:255],
+                        "objeto": str(it.get("objeto") or "Objeto publicado no DOEMA")[:1000],
+                        "valor_estimado": float(it["valor_estimado"]) if it.get("valor_estimado") else None,
+                        "data_disputa": it.get("data_disputa"),
+                        "link_edital": link_pdf,
+                        "municipio": str(it.get("municipio") or "São Luís")[:100],
+                        "estado": "MA",
+                        "modalidade": str(it.get("modalidade") or "Pregão Eletrônico")[:100],
+                        "regiao": "Nordeste",
+                        "esfera": "Estadual" if "ESTADO" in str(it.get("orgao")).upper() else "Municipal",
+                        "tipo_publicacao": "COTACAO" if "dispensa" in str(it.get("modalidade")).lower() else "AVISO",
+                        "numero_processo": str(it.get("numero_processo") or f"DOEMA-{data_edicao}")[:50],
+                        "fonte": "DOEMA"
+                    })
+                return formatados
+        except Exception as err_openai:
+            logging.warning(f"Falha na chamada OpenAI ({err_openai}). Alternando para fallback heurístico.")
 
-    for item in amostras_diarios:
-        editais = processar_com_ia(item["texto"], uf_padrao=item["uf"])
-        salvar_editais_supabase(editais, texto_contexto=item["texto"])
+    # 2. Tentativa com Google Gemini
+    if gemini_model:
+        try:
+            logging.info("Chamando Google Gemini (gemini-1.5-flash) para estruturação de editais...")
+            response = gemini_model.generate_content(
+                prompt,
+                generation_config={"response_mime_type": "application/json"}
+            )
+            parsed = json.loads(response.text)
+            itens = parsed if isinstance(parsed, list) else parsed.get("licitacoes") or parsed.get("editais") or list(parsed.values())[0]
 
-def salvar_editais_supabase(editais: list, texto_contexto: str = ""):
+            if isinstance(itens, list) and len(itens) > 0:
+                formatados = []
+                for it in itens:
+                    hash_val = hashlib.md5(f"{it.get('orgao')}{it.get('objeto')}{it.get('data_disputa')}".encode()).hexdigest()[:8]
+                    formatados.append({
+                        "id_externo": f"DOEMA-{caderno}-{data_edicao}-{hash_val}",
+                        "orgao": str(it.get("orgao") or "Órgão Público Estadual/Municipal - MA")[:255],
+                        "objeto": str(it.get("objeto") or "Objeto publicado no DOEMA")[:1000],
+                        "valor_estimado": float(it["valor_estimado"]) if it.get("valor_estimado") else None,
+                        "data_disputa": it.get("data_disputa"),
+                        "link_edital": link_pdf,
+                        "municipio": str(it.get("municipio") or "São Luís")[:100],
+                        "estado": "MA",
+                        "modalidade": str(it.get("modalidade") or "Pregão Eletrônico")[:100],
+                        "regiao": "Nordeste",
+                        "esfera": "Estadual" if "ESTADO" in str(it.get("orgao")).upper() else "Municipal",
+                        "tipo_publicacao": "COTACAO" if "dispensa" in str(it.get("modalidade")).lower() else "AVISO",
+                        "numero_processo": str(it.get("numero_processo") or f"DOEMA-{data_edicao}")[:50],
+                        "fonte": "DOEMA"
+                    })
+                return formatados
+        except Exception as err_gemini:
+            logging.warning(f"Falha na chamada Gemini ({err_gemini}). Alternando para fallback heurístico.")
+
+    # 3. Fallback Heurístico em Regex
+    return extrair_licitacoes_heuristicas(texto_bloco, data_edicao, link_pdf, caderno)
+
+# ============================================================================
+# 5. MOTOR PRINCIPAL DE PROCESSAMENTO DO DOEMA
+# ============================================================================
+def processar_doema(cadernos: list = None, data_manual: str = None) -> list:
     """
-    Persiste os dados no Supabase, garantindo higienização de município,
-    estado (MA, PA ou TO) e coordenadas PostGIS precisas.
+    Executa a captura, pré-filtragem, extração estruturada e persistência de editais futuros.
     """
-    total_salvos = 0
-    for edital in editais:
-        municipio_raw = edital.get("municipio") or ""
-        estado_raw = edital.get("estado") or ""
+    fuso_bsb = ZoneInfo("America/Sao_Paulo")
+    agora = datetime.now(fuso_bsb)
 
-        # Higienização e validação das UFs
-        municipio, estado, coordenadas_wkt = identificar_uf_municipio(
-            municipio_raw, estado_raw, texto_contexto
-        )
+    data_base = agora
+    if data_manual:
+        try:
+            data_base = datetime.strptime(data_manual, "%Y%m%d").replace(tzinfo=fuso_bsb)
+        except Exception:
+            logging.warning(f"Data manual '{data_manual}' inválida. Usando data atual.")
 
-        regiao = (
-            "Norte" if estado in ["AC", "AP", "AM", "PA", "RO", "RR", "TO"] else
-            "Nordeste" if estado in ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE"] else
-            "Centro-Oeste" if estado in ["DF", "GO", "MT", "MS"] else
-            "Sudeste" if estado in ["ES", "MG", "RJ", "SP"] else "Sul"
-        )
-        orgao_nome = edital.get("orgao", f"Órgão Público Estadual/Municipal ({estado})")
-        esfera = (
-            "Estadual" if "ESTADO" in orgao_nome.upper() or "SECRETARIA DE ESTADO" in orgao_nome.upper() else
-            "Federal" if "FEDERAL" in orgao_nome.upper() or "MINISTERIO" in orgao_nome.upper() else
-            "Municipal"
-        )
+    cadernos_processar = cadernos or ["TE", "EX"]  # Prioriza TE (Prefeituras) e EX (Executivo)
+    todos_editais_futuros = []
 
-        registro = {
-            "id_externo": edital.get("id_externo") or f"DO_{estado}_{int(time.time()*1000)}",
-            "orgao": orgao_nome[:255],
-            "objeto": edital.get("objeto", "Objeto não informado"),
-            "valor_estimado": edital.get("valor_estimado"),
-            "data_disputa": edital.get("data_disputa"),
-            "link_edital": edital.get("link_edital"),
-            "municipio": municipio[:100],
-            "estado": estado[:2],
-            "modalidade": edital.get("modalidade") or ("Concorrência Eletrônica" if "CONCORRENCIA" in edital.get("objeto", "").upper() else "Pregão Eletrônico"),
-            "regiao": regiao,
-            "esfera": esfera,
-            "tipo_publicacao": "AVISO",
-            "numero_processo": edital.get("numero_processo") or f"D.O. {estado} {int(time.time()*1000)%10000}",
-            "coordenadas": coordenadas_wkt,
-            "fonte": "DIARIO_OFICIAL"
-        }
+    logging.info(f"\n=======================================================")
+    logging.info(f"=== INICIANDO CAPTURA DOEMA (Horário BSB: {agora.strftime('%d/%m/%Y %H:%M:%S')}) ===")
+    logging.info(f"Cadernos: {cadernos_processar}")
+    logging.info(f"=======================================================\n")
 
-        if supabase:
+    for caderno in cadernos_processar:
+        pdf_bytes, url_pdf, data_efetiva = baixar_caderno_doema(caderno, data_base, retroceder_dias=3)
+        if not pdf_bytes:
+            logging.warning(f"[{caderno}] Não foi possível obter nenhuma edição válida do DOEMA nos últimos 3 dias.")
+            continue
+
+        logging.info(f"[{caderno}] Analisando páginas com pdfplumber (edição {data_efetiva})...")
+        paginas_relevantes = []
+
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                total_paginas = len(pdf.pages)
+                for idx, pagina in enumerate(pdf.pages):
+                    texto = pagina.extract_text() or ""
+                    texto_up = texto.upper()
+                    # Pré-filtro inteligente: só processa páginas com termos licitatórios
+                    if any(termo in texto_up for termo in TERMOS_PRE_FILTRO):
+                        paginas_relevantes.append((idx + 1, texto))
+
+                logging.info(f"[{caderno}] Total de Páginas: {total_paginas} | Páginas Filtradas com Licitação: {len(paginas_relevantes)}")
+
+                # Processa páginas filtradas
+                for num_pag, texto_pag in paginas_relevantes:
+                    # Se tiver IA configurada, envia para estruturação; caso contrário roda heurística
+                    if openai_client or gemini_model:
+                        extraidos = extrair_licitacoes_com_ia(texto_pag, data_efetiva, url_pdf, caderno)
+                    else:
+                        extraidos = extrair_licitacoes_heuristicas(texto_pag, data_efetiva, url_pdf, caderno)
+
+                    # 4. REGRA DE OURO: FILTRO ESTRITO DE DATA FUTURA (data_disputa >= agora)
+                    for edital in extraidos:
+                        dt_disputa_str = edital.get("data_disputa")
+                        if not dt_disputa_str:
+                            continue
+
+                        try:
+                            dt_disputa_obj = datetime.fromisoformat(dt_disputa_str.replace("Z", "+00:00"))
+                            if dt_disputa_obj.tzinfo is None:
+                                dt_disputa_obj = dt_disputa_obj.replace(tzinfo=fuso_bsb)
+
+                            # Só aceita se for oportunidade futura
+                            if dt_disputa_obj >= agora:
+                                todos_editais_futuros.append(edital)
+                                logging.info(f"[{caderno} - Pág {num_pag}] Oportunidade Futura Capturada: {edital['municipio']} | {edital['modalidade']} | Disputa: {dt_disputa_str} | {edital['objeto'][:60]}...")
+                            else:
+                                logging.debug(f"Descartado edital expirado ({dt_disputa_str})")
+                        except Exception as dt_err:
+                            logging.debug(f"Erro ao comparar data: {dt_err}")
+
+        except Exception as e_pdf:
+            logging.error(f"[{caderno}] Erro ao abrir PDF com pdfplumber: {e_pdf}")
+
+    # ============================================================================
+    # 5. PERSISTÊNCIA NO SUPABASE E BACKUP LOCAL
+    # ============================================================================
+    logging.info(f"\n=== PROCESSAMENTO CONCLUÍDO ===")
+    logging.info(f"Total de Editais Futuros Encontrados no DOEMA: {len(todos_editais_futuros)}")
+
+    # Salva backup em JSON local para resiliência
+    backup_path = os.path.join(os.path.dirname(__file__), "editais_doema_backup.json")
+    try:
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump(todos_editais_futuros, f, ensure_ascii=False, indent=2)
+        logging.info(f"Backup local salvo em: {backup_path}")
+    except Exception as e_bkp:
+        logging.warning(f"Aviso ao salvar backup local: {e_bkp}")
+
+    # Gravação no Supabase via UPSERT (on_conflict="id_externo")
+    if supabase and len(todos_editais_futuros) > 0:
+        sucesso = 0
+        falhas = 0
+        logging.info(f"Gravando {len(todos_editais_futuros)} editais futuros na tabela 'licitacoes' do Supabase...")
+
+        for edital in todos_editais_futuros:
             try:
-                supabase.table("licitacoes").upsert(registro, on_conflict="id_externo").execute()
-                total_salvos += 1
-            except Exception as err:
-                logging.error(f"Erro ao salvar edital do Diário no Supabase: {err}")
-        else:
-            total_salvos += 1
+                supabase.table("licitacoes").upsert(edital, on_conflict="id_externo").execute()
+                sucesso += 1
+            except Exception as e_upsert:
+                falhas += 1
+                logging.error(f"Erro ao gravar edital {edital.get('id_externo')} no Supabase: {e_upsert}")
 
-    logging.info(f"Total de editais de Diários Oficiais gravados/processados: {total_salvos}")
+        logging.info(f"Supabase: {sucesso} editais gravados/atualizados com sucesso ({falhas} falhas).")
+    elif not supabase:
+        logging.warning("Supabase não disponível. Os editais foram salvos no backup local.")
 
-def agendador():
-    """
-    Agenda a execução para 12:00 e 18:00 (Horário de Brasília).
-    """
-    logging.info("Agendador de Diários Oficiais ativo para MA, PA e TO (Horários: 12:00 e 18:00 - Brasília).")
+    return todos_editais_futuros
 
-    schedule.every().day.at("12:00").do(baixar_e_processar_diario)
-    schedule.every().day.at("18:00").do(baixar_e_processar_diario)
+# ============================================================================
+# 6. ROTINA DE AGENDAMENTO (SCHEDULE 12:00 e 18:00) E CLI
+# ============================================================================
+def executar_rotina(data_manual: str = None, caderno_manual: str = None):
+    cadernos = [caderno_manual.upper()] if caderno_manual else ["TE", "EX"]
+    processar_doema(cadernos=cadernos, data_manual=data_manual)
 
-    # Execução inicial
-    baixar_e_processar_diario()
+def main():
+    parser = argparse.ArgumentParser(description="Scraper e Extrator Automatizado do Diário Oficial do Maranhão (DOEMA)")
+    parser.add_argument("--now", action="store_true", help="Executa a extração imediatamente no terminal")
+    parser.add_argument("--date", type=str, default=None, help="Data específica no formato YYYYMMDD (ex: 20261021)")
+    parser.add_argument("--caderno", type=str, default=None, help="Caderno específico para processar: TE ou EX")
+    args = parser.parse_args()
 
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+    if args.now or args.date:
+        logging.info("Modo de execução imediata acionado.")
+        executar_rotina(data_manual=args.date, caderno_manual=args.caderno)
+    else:
+        logging.info("Iniciando agendador DOEMA.")
+        logging.info("Rotinas programadas para todos os dias às 12:00 e às 18:00 (Horário de Brasília).")
+        logging.info("Pressione Ctrl+C para encerrar.")
+
+        schedule.every().day.at("12:00").do(executar_rotina)
+        schedule.every().day.at("18:00").do(executar_rotina)
+
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
 
 if __name__ == "__main__":
-    agendador()
+    main()

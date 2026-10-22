@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { 
   Search, 
   MapPin, 
@@ -14,7 +14,8 @@ import {
   Globe2,
   CalendarDays,
   ArrowUpDown,
-  FileCheck2
+  FileCheck2,
+  X
 } from "lucide-react";
 import { FiltrosLicitacao } from "@/lib/types";
 
@@ -54,6 +55,40 @@ export function Filtros({
   carregando
 }: FiltrosProps) {
   const [expandido, setExpandido] = useState(false);
+  const [municipiosSugeridos, setMunicipiosSugeridos] = useState<string[]>([]);
+  const [carregandoMunicipios, setCarregandoMunicipios] = useState(false);
+
+  // Busca municípios dinamicamente direto do banco sob demanda quando a UF mudar
+  useEffect(() => {
+    let ativo = true;
+
+    async function carregarMunicipiosDaUF() {
+      if (!filtros.estado || filtros.estado === "TODOS") {
+        setMunicipiosSugeridos([]);
+        return;
+      }
+
+      setCarregandoMunicipios(true);
+      try {
+        const resp = await fetch(`/api/municipios?uf=${encodeURIComponent(filtros.estado)}`);
+        if (!resp.ok) throw new Error("Erro ao carregar cidades");
+        const data = await resp.json();
+        if (ativo && data.municipios) {
+          setMunicipiosSugeridos(data.municipios);
+        }
+      } catch (err) {
+        console.warn("Erro ao buscar municípios sob demanda:", err);
+      } finally {
+        if (ativo) setCarregandoMunicipios(false);
+      }
+    }
+
+    carregarMunicipiosDaUF();
+
+    return () => {
+      ativo = false;
+    };
+  }, [filtros.estado]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -62,6 +97,19 @@ export function Filtros({
 
   const handleTabTipo = (tipo: string) => {
     onChangeFiltros({ ...filtros, tipoPublicacao: tipo });
+  };
+
+  const handleEstadoChange = (novoEstado: string) => {
+    // Ao trocar a UF, reseta o município se não fizer mais sentido ou permite manter
+    onChangeFiltros({
+      ...filtros,
+      estado: novoEstado,
+      municipio: "" // Limpa o município para incentivar a escolha das novas cidades da UF
+    });
+  };
+
+  const handleLimparMunicipio = () => {
+    onChangeFiltros({ ...filtros, municipio: "" });
   };
 
   const tipoAtual = filtros.tipoPublicacao || "TODOS";
@@ -134,7 +182,7 @@ export function Filtros({
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-4">
-        {/* Barra de Busca com Stemming / Radical */}
+        {/* Barra de Busca com Server-Side Filtering (.ilike) */}
         <div>
           <div className="relative">
             <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-slate-400">
@@ -142,7 +190,7 @@ export function Filtros({
             </div>
             <input
               type="text"
-              placeholder="Digite produtos ou serviços (separados por vírgula, ex: 'medicamento, respirador, pavimentação')..."
+              placeholder="Digite produtos ou serviços (ex: 'medicamento', 'computador', 'pavimentação')..."
               value={filtros.busca || ""}
               onChange={(e) => onChangeFiltros({ ...filtros, busca: e.target.value })}
               className="w-full pl-12 pr-28 py-3.5 bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-500 text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50 focus:border-emerald-500 transition-all"
@@ -159,31 +207,12 @@ export function Filtros({
             </div>
           </div>
           <p className="mt-1.5 text-[11px] text-slate-500 pl-1">
-            * <strong>Busca inteligente por radical:</strong> encontra automaticamente variações no singular e plural (ex: &quot;computador&quot; localiza &quot;computadores&quot;, sem distinção de acentos).
+            * <strong>Busca Server-Side direta no banco:</strong> pesquisa em tempo real no objeto e órgão com operador <code>.ilike()</code>.
           </p>
         </div>
 
-        {/* Linha de Filtros Principais */}
+        {/* Linha de Filtros Principais: Estado (UF), Município Dinâmico, Modalidade, Agenda */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-          {/* Região Geográfica */}
-          <div className="relative">
-            <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
-              <Globe2 className="h-4 w-4" />
-            </div>
-            <select
-              value={filtros.regiao || ""}
-              onChange={(e) => onChangeFiltros({ ...filtros, regiao: e.target.value })}
-              className="w-full pl-10 pr-8 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-200 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 appearance-none cursor-pointer"
-            >
-              <option value="">Todas as Regiões</option>
-              {REGIOES.map((r) => (
-                <option key={r} value={r}>
-                  Região {r}
-                </option>
-              ))}
-            </select>
-          </div>
-
           {/* Estado / UF */}
           <div className="relative">
             <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
@@ -191,11 +220,11 @@ export function Filtros({
             </div>
             <select
               value={filtros.estado || ""}
-              onChange={(e) => onChangeFiltros({ ...filtros, estado: e.target.value })}
+              onChange={(e) => handleEstadoChange(e.target.value)}
               className="w-full pl-10 pr-8 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-200 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 appearance-none cursor-pointer"
             >
-              <option value="">Todos os Estados (UF)</option>
-              <optgroup label="Prioritários">
+              <option value="">Todos os Estados (Brasil)</option>
+              <optgroup label="Estados com Foco Prioritário">
                 <option value="MA">Maranhão (MA)</option>
                 <option value="PA">Pará (PA)</option>
                 <option value="TO">Tocantins (TO)</option>
@@ -208,6 +237,49 @@ export function Filtros({
                 ))}
               </optgroup>
             </select>
+          </div>
+
+          {/* Município: Entrada com População Dinâmica e Digitação Livre (.ilike) */}
+          <div className="relative">
+            <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+              {carregandoMunicipios ? (
+                <RefreshCw className="h-4 w-4 animate-spin text-emerald-400" />
+              ) : (
+                <MapPin className="h-4 w-4 text-emerald-400" />
+              )}
+            </div>
+
+            <input
+              type="text"
+              list="municipios-dinamicos-list"
+              placeholder={
+                filtros.estado
+                  ? `Cidade em ${filtros.estado} (digite ou selecione)...`
+                  : "Filtrar por cidade (digitação livre)..."
+              }
+              value={filtros.municipio || ""}
+              onChange={(e) => onChangeFiltros({ ...filtros, municipio: e.target.value })}
+              className="w-full pl-10 pr-8 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-500 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+            />
+
+            {/* Botão para limpar cidade quando preenchida */}
+            {filtros.municipio && (
+              <button
+                type="button"
+                onClick={handleLimparMunicipio}
+                className="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-white"
+                title="Limpar cidade"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+
+            {/* Datalist preenchido dinamicamente com cidades do banco sob demanda */}
+            <datalist id="municipios-dinamicos-list">
+              {municipiosSugeridos.map((cid) => (
+                <option key={cid} value={cid} />
+              ))}
+            </datalist>
           </div>
 
           {/* Modalidade de Licitação */}
@@ -248,9 +320,28 @@ export function Filtros({
           </div>
         </div>
 
-        {/* Painel Avançado Retrátil */}
+        {/* Painel Avançado Retrátil (Região, Esfera, Faixa de Valor, Ordenação) */}
         {expandido && (
           <div className="pt-3 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 animate-fade-in">
+            {/* Macro-Região */}
+            <div className="relative">
+              <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
+                <Globe2 className="h-4 w-4" />
+              </div>
+              <select
+                value={filtros.regiao || ""}
+                onChange={(e) => onChangeFiltros({ ...filtros, regiao: e.target.value })}
+                className="w-full pl-10 pr-8 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-slate-200 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500 appearance-none cursor-pointer"
+              >
+                <option value="">Todas as Regiões</option>
+                {REGIOES.map((r) => (
+                  <option key={r} value={r}>
+                    Região {r}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             {/* Esfera */}
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
@@ -268,20 +359,6 @@ export function Filtros({
                   </option>
                 ))}
               </select>
-            </div>
-
-            {/* Município */}
-            <div className="relative">
-              <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
-                <MapPin className="h-4 w-4" />
-              </div>
-              <input
-                type="text"
-                placeholder="Filtrar por cidade..."
-                value={filtros.municipio || ""}
-                onChange={(e) => onChangeFiltros({ ...filtros, municipio: e.target.value })}
-                className="w-full pl-10 pr-3 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white placeholder-slate-500 text-xs sm:text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-              />
             </div>
 
             {/* Valor Mínimo */}
@@ -317,6 +394,7 @@ export function Filtros({
                 <option value="disputa_desc">Data Disputa (Mais Distante)</option>
                 <option value="valor_desc">Maior Valor Estimado</option>
                 <option value="valor_asc">Menor Valor Estimado</option>
+                <option value="recentes">Mais Recentes (Publicação)</option>
               </select>
             </div>
           </div>
@@ -331,7 +409,7 @@ export function Filtros({
               className="flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 font-semibold py-1 px-2 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
             >
               <SlidersHorizontal className="h-3.5 w-3.5" />
-              <span>{expandido ? "Ocultar Filtros Avançados" : "Mais Filtros (Esfera, Município, Ordenação)"}</span>
+              <span>{expandido ? "Ocultar Filtros Adicionais" : "Mais Filtros (Região, Esfera, Valor, Ordenação)"}</span>
               {expandido ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
             </button>
           </div>
@@ -342,7 +420,7 @@ export function Filtros({
             className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200 py-1 px-2.5 rounded-lg hover:bg-slate-800 transition-colors cursor-pointer"
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            <span>Limpar Filtros</span>
+            <span>Limpar Todos os Filtros</span>
           </button>
         </div>
       </form>
