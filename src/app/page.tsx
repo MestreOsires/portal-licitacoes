@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { Header } from "@/components/Header";
 import { Filtros } from "@/components/Filtros";
-import { LicitacaoCard } from "@/components/LicitacaoCard";
+import { LicitacaoCardModerno } from "@/components/LicitacaoCardModerno";
 import { TabelaLicitacoes } from "@/components/TabelaLicitacoes";
 import { AlertaModal } from "@/components/AlertaModal";
 import { Licitacao, FiltrosLicitacao, PlacarDoDia } from "@/lib/types";
@@ -130,6 +130,22 @@ export default function Home() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const formatarDataAbertura = (dataStr: string | null): string => {
+    if (!dataStr) return "Data não informada";
+    try {
+      const data = new Date(dataStr);
+      return new Intl.DateTimeFormat("pt-BR", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit"
+      }).format(data);
+    } catch {
+      return dataStr;
+    }
   };
 
   return (
@@ -293,10 +309,21 @@ export default function Home() {
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
             {licitacoes.map((item) => (
-              <LicitacaoCard
+              <LicitacaoCardModerno
                 key={item.id}
-                licitacao={item}
-                onCriarAlertaDoTermo={handleCriarAlertaDoTermo}
+                orgao={item.orgao}
+                objeto={item.objeto}
+                localizacao={item.municipio}
+                uf={item.estado}
+                abertura={formatarDataAbertura(item.data_disputa)}
+                modalidade={item.modalidade || "Pregão Eletrônico"}
+                valorEstimado={item.valor_estimado}
+                linkEdital={item.link_edital}
+                fonte={item.fonte}
+                tipoPublicacao={item.tipo_publicacao}
+                numeroProcesso={item.numero_processo}
+                esfera={item.esfera}
+                onCriarAlerta={handleCriarAlertaDoTermo}
               />
             ))}
           </div>
