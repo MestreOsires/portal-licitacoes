@@ -89,13 +89,21 @@ export function LicitacaoCard({ licitacao, onCriarAlertaDoTermo }: LicitacaoCard
           <div className="flex items-center gap-1.5 flex-wrap">
             {getBadgeTipo(licitacao.tipo_publicacao)}
 
-            {licitacao.fonte === "DIARIO_OFICIAL" ? (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-purple-500/10 text-purple-300 border border-purple-500/20">
-                <Sparkles className="h-3 w-3" /> D.O. (IA)
+            {/* Badge distintivo de Fonte Oficial (DOEMA x PNCP) */}
+            {licitacao.fonte === "DOEMA" ? (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/40 shadow-sm shadow-amber-950/40">
+                <FileText className="h-3.5 w-3.5 text-amber-400" />
+                DOEMA • Diário Oficial MA
+              </span>
+            ) : licitacao.fonte === "PNCP" ? (
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-bold bg-blue-500/15 text-blue-300 border border-blue-500/40 shadow-sm shadow-blue-950/40">
+                <Building2 className="h-3.5 w-3.5 text-blue-400" />
+                PNCP • Portal Nacional
               </span>
             ) : (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-blue-500/10 text-blue-300 border border-blue-500/20">
-                PNCP
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-bold bg-purple-500/15 text-purple-300 border border-purple-500/40">
+                <Sparkles className="h-3.5 w-3.5 text-purple-400" />
+                {licitacao.fonte || "Diário Oficial"}
               </span>
             )}
           </div>
@@ -176,15 +184,29 @@ export function LicitacaoCard({ licitacao, onCriarAlertaDoTermo }: LicitacaoCard
         {/* Ações do Card */}
         <div className="flex items-center gap-2 pt-2 border-t border-slate-800">
           {licitacao.link_edital ? (
-            <a
-              href={licitacao.link_edital}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-white transition-colors"
-            >
-              <span>Acessar Edital</span>
-              <ExternalLink className="h-3.5 w-3.5" />
-            </a>
+            licitacao.fonte === "DOEMA" ? (
+              <a
+                href={licitacao.link_edital}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 text-amber-200 border border-amber-500/30 text-xs font-bold transition-all shadow-sm"
+              >
+                <FileText className="h-3.5 w-3.5 text-amber-400" />
+                <span>Abrir Edição no DOEMA (PDF)</span>
+                <ExternalLink className="h-3 w-3 opacity-70" />
+              </a>
+            ) : (
+              <a
+                href={licitacao.link_edital}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-1 flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-200 border border-blue-500/30 text-xs font-bold transition-all shadow-sm"
+              >
+                <Building2 className="h-3.5 w-3.5 text-blue-400" />
+                <span>Acessar Edital no PNCP</span>
+                <ExternalLink className="h-3.5 w-3.5 opacity-70" />
+              </a>
+            )
           ) : (
             <span className="flex-1 text-center py-2 px-3 text-xs text-slate-500">
               Edital em processamento

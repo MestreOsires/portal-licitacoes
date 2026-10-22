@@ -2,7 +2,7 @@
 
 import React from "react";
 import { Licitacao } from "@/lib/types";
-import { ExternalLink, BellRing, Share2 } from "lucide-react";
+import { ExternalLink, BellRing, Building2, FileText, Sparkles } from "lucide-react";
 
 interface TabelaLicitacoesProps {
   licitacoes: Licitacao[];
@@ -39,6 +39,7 @@ export function TabelaLicitacoes({ licitacoes, onCriarAlertaDoTermo }: TabelaLic
       <table className="w-full text-left text-xs border-collapse">
         <thead>
           <tr className="border-b border-slate-800 bg-slate-950/80 text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
+            <th className="py-3.5 px-4">Fonte</th>
             <th className="py-3.5 px-4">Local</th>
             <th className="py-3.5 px-4">Modalidade / Processo</th>
             <th className="py-3.5 px-4">Órgão</th>
@@ -54,6 +55,26 @@ export function TabelaLicitacoes({ licitacoes, onCriarAlertaDoTermo }: TabelaLic
               key={item.id}
               className="hover:bg-slate-800/40 transition-colors group"
             >
+              {/* Fonte Oficial */}
+              <td className="py-3 px-4 whitespace-nowrap">
+                {item.fonte === "DOEMA" ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[10px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                    <FileText className="h-3 w-3 text-amber-400" />
+                    DOEMA • MA
+                  </span>
+                ) : item.fonte === "PNCP" ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[10px] font-bold bg-blue-500/15 text-blue-300 border border-blue-500/30">
+                    <Building2 className="h-3 w-3 text-blue-400" />
+                    PNCP • Nacional
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[10px] font-bold bg-purple-500/15 text-purple-300 border border-purple-500/30">
+                    <Sparkles className="h-3 w-3 text-purple-400" />
+                    {item.fonte || "D.O."}
+                  </span>
+                )}
+              </td>
+
               {/* Local */}
               <td className="py-3 px-4 whitespace-nowrap">
                 <span className="font-bold text-white mr-1.5">{item.estado}</span>

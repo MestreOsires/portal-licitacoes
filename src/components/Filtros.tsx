@@ -15,7 +15,9 @@ import {
   CalendarDays,
   ArrowUpDown,
   FileCheck2,
-  X
+  X,
+  Building2,
+  FileText
 } from "lucide-react";
 import { FiltrosLicitacao } from "@/lib/types";
 
@@ -206,9 +208,51 @@ export function Filtros({
               </button>
             </div>
           </div>
-          <p className="mt-1.5 text-[11px] text-slate-500 pl-1">
-            * <strong>Busca Server-Side direta no banco:</strong> pesquisa em tempo real no objeto e órgão com operador <code>.ilike()</code>.
-          </p>
+          {/* Seletor Rápido de Fonte Oficial: Todos, PNCP, DOEMA */}
+          <div className="flex flex-wrap items-center justify-between gap-2 mt-2 pt-1">
+            <div className="flex items-center gap-1.5 flex-wrap text-xs">
+              <span className="text-slate-400 font-semibold mr-1">Filtrar por Fonte:</span>
+              <button
+                type="button"
+                onClick={() => onChangeFiltros({ ...filtros, fonte: "" })}
+                className={`px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  !filtros.fonte || filtros.fonte === "TODOS"
+                    ? "bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/20"
+                    : "bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700"
+                }`}
+              >
+                Todas as Fontes
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangeFiltros({ ...filtros, fonte: "PNCP" })}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  filtros.fonte === "PNCP"
+                    ? "bg-blue-600 text-white shadow-md shadow-blue-500/30 border border-blue-400"
+                    : "bg-slate-800 text-blue-300 hover:bg-blue-500/10 border border-blue-500/20"
+                }`}
+              >
+                <Building2 className="h-3.5 w-3.5 text-blue-400" />
+                <span>PNCP (Portal Nacional)</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onChangeFiltros({ ...filtros, fonte: "DOEMA" })}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  filtros.fonte === "DOEMA"
+                    ? "bg-amber-600 text-white shadow-md shadow-amber-500/30 border border-amber-400"
+                    : "bg-slate-800 text-amber-300 hover:bg-amber-500/10 border border-amber-500/20"
+                }`}
+              >
+                <FileText className="h-3.5 w-3.5 text-amber-400" />
+                <span>DOEMA (Diário Oficial - MA)</span>
+              </button>
+            </div>
+
+            <p className="text-[11px] text-slate-500 hidden sm:block">
+              * <strong>Busca Server-Side direta no banco:</strong> operador <code>.ilike()</code>.
+            </p>
+          </div>
         </div>
 
         {/* Linha de Filtros Principais: Estado (UF), Município Dinâmico, Modalidade, Agenda */}
